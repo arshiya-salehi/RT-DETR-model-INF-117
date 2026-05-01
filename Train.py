@@ -44,6 +44,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import OneCycleLR
 
 import torchvision
+from torchvision import tv_tensors
 from torchvision.transforms import v2 as T
 
 from transformers import (
@@ -83,7 +84,7 @@ NUM_CLASSES = len(CLASS_NAMES)  # 11
 # ── HYPERPARAMETERS ───────────────────────────────────────────────────────────
 # Tuned for 327 training images on an A100 with RT-DETR-L
 BATCH_SIZE   = 4        # A100 can handle batch 4 comfortably at 640px
-NUM_EPOCHS   = 72       # ~24 passes per epoch × 72 ≈ matches Mask R-CNN 8k iters
+NUM_EPOCHS   = 300       # ~24 passes per epoch × 72 ≈ matches Mask R-CNN 8k iters
 BASE_LR      = 1e-4     # standard RT-DETR learning rate
 WEIGHT_DECAY = 1e-4
 MAX_GRAD_NORM = 0.1     # gradient clipping (standard for DETR-family)
@@ -131,12 +132,15 @@ class DentalCocoDataset(torch.utils.data.Dataset):
 
         # Build id2name from categories stored in the JSON
         self.id2label = {cat["id"]: cat["name"] for cat in self.coco.loadCats(self.coco.getCatIds())}
-
+        self.tv_tensors=tv_tensors
+        
         # Augmentation pipeline (train only)
         self.aug = T.Compose([
             T.RandomHorizontalFlip(p=0.5),
-            T.ColorJitter(brightness=0.3, contrast=0.3),
+            T.RandomAffine(degrees=10, translate=(0.1, 0.1), scale=(0.8, 1.2)),
+            T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3),
             T.RandomAdjustSharpness(sharpness_factor=2, p=0.3),
+            T.SanitizeBoundingBoxes(), # Safely drops boxes if they are translated out of bounds
         ]) if augment else None
 
     def __len__(self):
@@ -158,30 +162,47 @@ class DentalCocoDataset(torch.utils.data.Dataset):
         anns    = self.coco.loadAnns(ann_ids)
 
         # Convert COCO [x_min, y_min, w, h] → [cx, cy, w, h] normalised
-        boxes  = []
+        boxes_xyxy = []
         labels = []
         for ann in anns:
             x, y, bw, bh = ann["bbox"]
-            cx = (x + bw / 2) / W_orig
-            cy = (y + bh / 2) / H_orig
-            nw = bw / W_orig
-            nh = bh / H_orig
-            # clamp to [0, 1]
-            cx, cy, nw, nh = (
-                max(0.0, min(1.0, cx)),
-                max(0.0, min(1.0, cy)),
-                max(0.0, min(1.0, nw)),
-                max(0.0, min(1.0, nh)),
-            )
-            if nw > 0 and nh > 0:
-                boxes.append([cx, cy, nw, nh])
-                labels.append(ann["category_id"])
-
-        # Apply augmentation before processor
+            boxes_xyxy.append([x, y, x + bw, y + bh])
+            labels.append(ann["category_id"])
+        boxes_tensor = torch.tensor(boxes_xyxy, dtype=torch.float32).reshape(-1, 4)
+        labels_tensor = torch.tensor(labels, dtype=torch.long)
+        # 1. Apply augmentations safely to BOTH image and boxes
         if self.aug is not None:
-            image = self.aug(image)
-
-        # Processor handles resize + normalize → (3, IMG_SIZE, IMG_SIZE) float
+            image_tv = self.tv_tensors.Image(image)
+            boxes_tv = self.tv_tensors.BoundingBoxes(
+                boxes_tensor, format="XYXY", canvas_size=(H_orig, W_orig)
+            )
+            # The transforms will now properly move the boxes when the image flips/shifts
+            # SanitizeBoundingBoxes requires a dict to properly drop labels if boxes are removed
+            out = self.aug({"image": image_tv, "boxes": boxes_tv, "labels": labels_tensor})
+            image = out["image"]
+            boxes_tv = out["boxes"]
+            labels_tensor = out["labels"]
+            boxes_tensor = boxes_tv.as_subclass(torch.Tensor)
+        # Update H and W in case spatial transforms changed them
+        _, H_new, W_new = image.shape
+        
+        # 2. Convert from XYXY pixel coords to Normalized CXCYWH (required by RT-DETR)
+        final_boxes = []
+        for box in boxes_tensor:
+            x1, y1, x2, y2 = box.tolist()
+            bw, bh = (x2 - x1), (y2 - y1)
+            cx = (x1 + bw / 2) / W_new
+            cy = (y1 + bh / 2) / H_new
+            nw = bw / W_new
+            nh = bh / H_new
+            
+            # Clamp to [0, 1]
+            cx, cy, nw, nh = (
+                max(0.0, min(1.0, cx)), max(0.0, min(1.0, cy)),
+                max(0.0, min(1.0, nw)), max(0.0, min(1.0, nh))
+            )
+            final_boxes.append([cx, cy, nw, nh])
+        # 3. Processor handles resize + normalize → (3, IMG_SIZE, IMG_SIZE) float
         encoding = self.processor(
             images=image,
             return_tensors="pt",
@@ -189,13 +210,11 @@ class DentalCocoDataset(torch.utils.data.Dataset):
             size={"height": IMG_SIZE, "width": IMG_SIZE},
         )
         pixel_values = encoding["pixel_values"].squeeze(0)  # (3, H, W)
-
         target = {
-            "class_labels": torch.tensor(labels, dtype=torch.long),
-            "boxes":        torch.tensor(boxes,  dtype=torch.float32)
-            if boxes else   torch.zeros((0, 4),  dtype=torch.float32),
+            "class_labels": labels_tensor,
+            "boxes":        torch.tensor(final_boxes, dtype=torch.float32)
+                            if final_boxes else torch.zeros((0, 4), dtype=torch.float32),
         }
-
         return pixel_values, target, img_id
 
 
@@ -331,10 +350,10 @@ def main():
     optimizer = AdamW(param_groups, weight_decay=WEIGHT_DECAY)
 
     total_steps = NUM_EPOCHS * len(train_loader)
-    scheduler   = OneCycleLR(
-        optimizer, max_lr=[BASE_LR * 0.1, BASE_LR],
-        total_steps=total_steps, pct_start=0.05,
-        anneal_strategy="cos",
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, 
+        T_max=total_steps, 
+        eta_min=1e-6
     )
 
     scaler = torch.amp.GradScaler()
