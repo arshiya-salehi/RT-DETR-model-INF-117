@@ -83,15 +83,15 @@ NUM_CLASSES = len(CLASS_NAMES)  # 11
 
 # ── HYPERPARAMETERS ───────────────────────────────────────────────────────────
 # Tuned for 327 training images on an A100 with RT-DETR-L
-BATCH_SIZE   = 4        # A100 can handle batch 4 comfortably at 640px
-NUM_EPOCHS   = 300       # ~24 passes per epoch × 72 ≈ matches Mask R-CNN 8k iters
-BASE_LR      = 1e-4     # standard RT-DETR learning rate
+BATCH_SIZE   = 16       # 48GB L40S can handle batch 16 at 800px
+NUM_EPOCHS   = 500      # Higher epochs for Transformer convergence
+BASE_LR      = 2e-4     # Slightly higher LR for larger batch size
 WEIGHT_DECAY = 1e-4
 MAX_GRAD_NORM = 0.1     # gradient clipping (standard for DETR-family)
-IMG_SIZE     = 640      # RT-DETR default input size; matches YOLOv8 convention
-NUM_WORKERS  = 4
+IMG_SIZE     = 1024      # Higher resolution for small lesions/decay
+NUM_WORKERS  = 32       # Maximize 128-core AMD EPYC CPU
 SCORE_THRESH = 0.4      # inference confidence threshold
-SAVE_EVERY   = 5        # save a checkpoint every N epochs
+SAVE_EVERY   = 10       # save a checkpoint every N epochs
 
 # Pretrained model — RT-DETR-R50 is the best accuracy/speed tradeoff
 PRETRAINED_MODEL = "PekingU/rtdetr_r50vd"
